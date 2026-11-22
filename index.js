@@ -1,4 +1,3 @@
-
 require("dotenv").config();
 
 const {
@@ -12,7 +11,8 @@ const {
   EmbedBuilder
 } = require("discord.js");
 
-const Database = require("better-sqlite3");
+const { MongoClient } = require("mongodb");
+const http = require("http");
 
 // =====================================
 // CONFIGURATION
@@ -21,6 +21,9 @@ const Database = require("better-sqlite3");
 const TOKEN = process.env.DISCORD_TOKEN;
 const CLIENT_ID = process.env.CLIENT_ID;
 const GUILD_ID = process.env.GUILD_ID;
+const MONGO_URI = process.env.MONGO_URI;
+const PORT = process.env.PORT || 3000;
+const PING_URL = "https://lirzox-bot.onrender.com/";
 
 const CONFIG = {
   color: 0x5865F2,
@@ -31,8 +34,8 @@ const CONFIG = {
   currency: "Lirzox Coins"
 };
 
-if (!TOKEN || !CLIENT_ID || !GUILD_ID) {
-  throw new Error("Configure DISCORD_TOKEN, CLIENT_ID et GUILD_ID dans .env");
+if (!TOKEN || !CLIENT_ID || !GUILD_ID || !MONGO_URI) {
+  throw new Error("Configure DISCORD_TOKEN, CLIENT_ID, GUILD_ID et MONGO_URI dans .env");
 }
 
 // =====================================
@@ -52,58 +55,38 @@ const client = new Client({
 // BASE DE DONNÉES
 // =====================================
 
-const db = new Database("lirzox.sqlite");
+const mongo = new MongoClient(MONGO_URI);
 
-db.pragma("journal_mode = WAL");
+let users, warnings, inventory;
 
-db.exec(`
-CREATE TABLE IF NOT EXISTS users (
-  user_id TEXT PRIMARY KEY,
-  guild_id TEXT NOT NULL,
-  money INTEGER DEFAULT 0,
-  xp INTEGER DEFAULT 0,
-  last_daily INTEGER DEFAULT 0,
-  UNIQUE(user_id, guild_id)
-);
+async function connectDb() {
+  await mongo.connect();
+  const db = mongo.db("lirzox");
 
-CREATE TABLE IF NOT EXISTS warnings (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  guild_id TEXT NOT NULL,
-  user_id TEXT NOT NULL,
-  moderator_id TEXT NOT NULL,
-  reason TEXT NOT NULL,
-  date INTEGER NOT NULL
-);
+  users = db.collection("users");
+  warnings = db.collection("warnings");
+  inventory = db.collection("inventory");
 
-CREATE TABLE IF NOT EXISTS inventory (
-  user_id TEXT NOT NULL,
-  guild_id TEXT NOT NULL,
-  item TEXT NOT NULL,
-  quantity INTEGER DEFAULT 0,
-  PRIMARY KEY(user_id, guild_id, item)
-);
-`);
+  await users.createIndex({ user_id: 1, guild_id: 1 }, { unique: true });
+  await inventory.createIndex({ user_id: 1, guild_id: 1, item: 1 }, { unique: true });
 
-const getUser = db.prepare(`
-INSERT OR IGNORE INTO users (user_id, guild_id)
-VALUES (?, ?)
-`);
-
-const getAccount = db.prepare(`
-SELECT * FROM users WHERE user_id = ? AND guild_id = ?
-`);
-
-function account(userId, guildId) {
-  getUser.run(userId, guildId);
-  return getAccount.get(userId, guildId);
+  console.log("MongoDB connecté !");
 }
 
-function addMoney(userId, guildId, amount) {
-  account(userId, guildId);
-  db.prepare(`
-    UPDATE users SET money = money + ?
-    WHERE user_id = ? AND guild_id = ?
-  `).run(amount, userId, guildId);
+async function account(userId, guildId) {
+  return users.findOneAndUpdate(
+    { user_id: userId, guild_id: guildId },
+    { $setOnInsert: { money: 0, xp: 0, last_daily: 0 } },
+    { upsert: true, returnDocument: "after" }
+  );
+}
+
+async function addMoney(userId, guildId, amount) {
+  await account(userId, guildId);
+  await users.updateOne(
+    { user_id: userId, guild_id: guildId },
+    { $inc: { money: amount } }
+  );
 }
 
 function embed(title, description, color = CONFIG.color) {
@@ -339,16 +322,16 @@ client.on("messageCreate", async message => {
 
   cooldowns.set(key, now);
 
-  account(message.author.id, message.guild.id);
+  await account(message.author.id, message.guild.id);
 
   const xp = Math.floor(Math.random() * 11) + 15;
 
-  db.prepare(`
-    UPDATE users SET xp = xp + ?
-    WHERE user_id = ? AND guild_id = ?
-  `).run(xp, message.author.id, message.guild.id);
+  await users.updateOne(
+    { user_id: message.author.id, guild_id: message.guild.id },
+    { $inc: { xp: xp } }
+  );
 
-  const user = account(message.author.id, message.guild.id);
+  const user = await account(message.author.id, message.guild.id);
   const level = Math.floor(Math.sqrt(user.xp / 100));
 
   const previousXP = user.xp - xp;
@@ -472,10 +455,13 @@ client.on("interactionCreate", async interaction => {
       const target = interaction.options.getUser("membre");
       const reason = interaction.options.getString("raison");
 
-      db.prepare(`
-        INSERT INTO warnings (guild_id, user_id, moderator_id, reason, date)
-        VALUES (?, ?, ?, ?, ?)
-      `).run(guild.id, target.id, user.id, reason, Date.now());
+      await warnings.insertOne({
+        guild_id: guild.id,
+        user_id: target.id,
+        moderator_id: user.id,
+        reason: reason,
+        date: Date.now()
+      });
 
       await sendLog(guild, "⚠️ Avertissement", `${target.tag}\nModérateur : ${user.tag}\nRaison : ${reason}`);
 
@@ -489,14 +475,13 @@ client.on("interactionCreate", async interaction => {
     if (commandName === "warnings") {
       const target = interaction.options.getUser("membre");
 
-      const rows = db.prepare(`
-        SELECT * FROM warnings
-        WHERE guild_id = ? AND user_id = ?
-        ORDER BY date DESC
-      `).all(guild.id, target.id);
+      const rows = await warnings
+        .find({ guild_id: guild.id, user_id: target.id })
+        .sort({ date: -1 })
+        .toArray();
 
       const description = rows.length
-        ? rows.map(w => `**#${w.id}** — ${w.reason} (par <@${w.moderator_id}>)`).join("\n")
+        ? rows.map(w => `**#${w._id.toString().slice(-6)}** — ${w.reason} (par <@${w.moderator_id}>)`).join("\n")
         : "Aucun avertissement.";
 
       return interaction.reply({
@@ -528,7 +513,7 @@ client.on("interactionCreate", async interaction => {
 
     if (commandName === "solde") {
       const target = interaction.options.getUser("membre") || user;
-      const data = account(target.id, guild.id);
+      const data = await account(target.id, guild.id);
 
       return interaction.reply({
         embeds: [
@@ -542,7 +527,7 @@ client.on("interactionCreate", async interaction => {
     // -----------------------------
 
     if (commandName === "journalier") {
-      const data = account(user.id, guild.id);
+      const data = await account(user.id, guild.id);
       const now = Date.now();
       const day = 24 * 60 * 60 * 1000;
 
@@ -557,10 +542,10 @@ client.on("interactionCreate", async interaction => {
 
       const reward = 500;
 
-      db.prepare(`
-        UPDATE users SET money = money + ?, last_daily = ?
-        WHERE user_id = ? AND guild_id = ?
-      `).run(reward, now, user.id, guild.id);
+      await users.updateOne(
+        { user_id: user.id, guild_id: guild.id },
+        { $inc: { money: reward }, $set: { last_daily: now } }
+      );
 
       return interaction.reply(`🎁 Tu as reçu **${reward} ${CONFIG.currency}** !`);
     }
@@ -580,7 +565,7 @@ client.on("interactionCreate", async interaction => {
         });
       }
 
-      const sender = account(user.id, guild.id);
+      const sender = await account(user.id, guild.id);
 
       if (sender.money < amount) {
         return interaction.reply({
@@ -589,12 +574,19 @@ client.on("interactionCreate", async interaction => {
         });
       }
 
-      const transaction = db.transaction(() => {
-        addMoney(user.id, guild.id, -amount);
-        addMoney(target.id, guild.id, amount);
-      });
+      const paid = await users.updateOne(
+        { user_id: user.id, guild_id: guild.id, money: { $gte: amount } },
+        { $inc: { money: -amount } }
+      );
 
-      transaction();
+      if (paid.modifiedCount === 0) {
+        return interaction.reply({
+          content: "❌ Tu n'as pas assez d'argent.",
+          ephemeral: true
+        });
+      }
+
+      await addMoney(target.id, guild.id, amount);
 
       return interaction.reply(`💸 Tu as envoyé **${amount} ${CONFIG.currency}** à ${target}.`);
     }
@@ -628,7 +620,7 @@ client.on("interactionCreate", async interaction => {
       };
 
       const price = prices[item];
-      const data = account(user.id, guild.id);
+      const data = await account(user.id, guild.id);
 
       if (data.money < price) {
         return interaction.reply({
@@ -637,18 +629,23 @@ client.on("interactionCreate", async interaction => {
         });
       }
 
-      const transaction = db.transaction(() => {
-        addMoney(user.id, guild.id, -price);
+      const bought = await users.updateOne(
+        { user_id: user.id, guild_id: guild.id, money: { $gte: price } },
+        { $inc: { money: -price } }
+      );
 
-        db.prepare(`
-          INSERT INTO inventory (user_id, guild_id, item, quantity)
-          VALUES (?, ?, ?, 1)
-          ON CONFLICT(user_id, guild_id, item)
-          DO UPDATE SET quantity = quantity + 1
-        `).run(user.id, guild.id, item);
-      });
+      if (bought.modifiedCount === 0) {
+        return interaction.reply({
+          content: "❌ Tu n'as pas assez de coins.",
+          ephemeral: true
+        });
+      }
 
-      transaction();
+      await inventory.updateOne(
+        { user_id: user.id, guild_id: guild.id, item: item },
+        { $inc: { quantity: 1 } },
+        { upsert: true }
+      );
 
       return interaction.reply(`🛍️ Tu as acheté **${item}** pour ${price} coins !\nL'article est dans ton inventaire.`);
     }
@@ -658,10 +655,9 @@ client.on("interactionCreate", async interaction => {
     // -----------------------------
 
     if (commandName === "inventaire") {
-      const items = db.prepare(`
-        SELECT item, quantity FROM inventory
-        WHERE user_id = ? AND guild_id = ?
-      `).all(user.id, guild.id);
+      const items = await inventory
+        .find({ user_id: user.id, guild_id: guild.id })
+        .toArray();
 
       const description = items.length
         ? items.map(i => `🎁 **${i.item}** × ${i.quantity}`).join("\n")
@@ -800,7 +796,7 @@ client.on("interactionCreate", async interaction => {
 
     if (commandName === "niveau") {
       const target = interaction.options.getUser("membre") || user;
-      const data = account(target.id, guild.id);
+      const data = await account(target.id, guild.id);
 
       const level = Math.floor(Math.sqrt(data.xp / 100));
       const nextXP = (level + 1) ** 2 * 100;
@@ -820,11 +816,11 @@ client.on("interactionCreate", async interaction => {
     // -----------------------------
 
     if (commandName === "classement") {
-      const rows = db.prepare(`
-        SELECT user_id, xp FROM users
-        WHERE guild_id = ?
-        ORDER BY xp DESC LIMIT 10
-      `).all(guild.id);
+      const rows = await users
+        .find({ guild_id: guild.id })
+        .sort({ xp: -1 })
+        .limit(10)
+        .toArray();
 
       const description = rows.length
         ? rows.map((r, i) =>
@@ -857,7 +853,21 @@ client.on("interactionCreate", async interaction => {
 // CONNEXION ET ENREGISTREMENT
 // =====================================
 
+// Mini serveur web (obligatoire pour un Web Service Render)
+http.createServer((req, res) => {
+  res.writeHead(200);
+  res.end("Lirzox Bot en ligne");
+}).listen(PORT, () => console.log(`Serveur web sur le port ${PORT}`));
+
+// Ping toutes les 5 minutes pour éviter la mise en veille
+setInterval(() => {
+  fetch(PING_URL)
+    .then(() => console.log("Ping OK"))
+    .catch(err => console.log("Ping échoué :", err.message));
+}, 5 * 60 * 1000);
+
 async function startBot() {
+  await connectDb();
   await registerCommands();
   await client.login(TOKEN);
 }
